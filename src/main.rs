@@ -3,19 +3,20 @@ use hid::reports::*;
 use hid::descriptors::*;
 use hid::descriptor_items::*;
 use hut::*;
-use std::fs::File;
-use std::io::{Read, Write};
+use tokio::fs::File;
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tonic::Request;
 use usb_gadget::{Class, Config, default_udc, Id, Gadget, remove_all, Strings};
 use usb_gadget::function::hid::Hid;
 use btspeak_key_interceptor::btspeak_key_interceptor_client::BtspeakKeyInterceptorClient;
-use btspeak_key_interceptor::{Empty, BrailleKeyCombination, BrailleKeyCombinations, BrailleKeyEvent, BrailleKeyEvents};
+use btspeak_key_interceptor::{Empty, BrailleKeyEvent};
 mod btspeak_key_interceptor {
   tonic::include_proto!("btspeak_key_interceptor");
 }
 bitflags! {
   #[derive(Debug, PartialEq, Eq, Clone)]
-  struct DotFlags: u8 {
+  struct KeyFlags: u16 {
     const Dot1 = 1;
     const Dot2 = 1 << 1;
     const Dot3 = 1 << 2;
@@ -24,6 +25,7 @@ bitflags! {
     const Dot6 = 1 << 5;
     const Dot7 = 1 << 6;
     const Dot8 = 1 << 7;
+    const Space = 1 << 8;
   }
 }
 #[tokio::main]
@@ -590,7 +592,6 @@ async fn main() {
           MainItem::Collection(Collection {
             ty: CollectionType::Logical,
             usage: None,
-//            usage: Some(BrailleDisplay::BrailleButtons.usage_value()),
             items: vec![
               MainItem::Report(input_report.clone()),
             ],
@@ -621,84 +622,66 @@ async fn main() {
     .with_config(config)
     .bind(&default_udc().unwrap())
     .unwrap();
-  let mut device = File::options().read(true).write(true).open("/dev/hidg0").unwrap();
+  let (event_tx, mut event_rx) = mpsc::channel::<BrailleKeyEvent>(32);
+  let device = File::options().read(true).write(true).open("/dev/hidg0").await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-  let report = write_report(input_report.clone(), vec![
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-  ]);
-  let report: Vec<u8> = report.into();
-  device.write(&report).unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-  let report = write_report(input_report.clone(), vec![
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(1)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-  ]);
-  let report: Vec<u8> = report.into();
-  device.write(&report).unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-  let report = write_report(input_report.clone(), vec![
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-    ReportFieldValue::UnsignedVariable(Some(0)),
-  ]);
-  let report: Vec<u8> = report.into();
-  device.write(&report).unwrap();
-//  device.sync_all().unwrap();
-  let mut buffer = vec![0; 64];
-  loop {
-    let count = device.read(&mut buffer).unwrap();
-    buffer.resize(count, 0);
-    println!("Report received");
-    println!("{:?}", read_report(output_report.clone(), buffer.clone().try_into().unwrap()));
-    buffer.resize(64, 0);
-  };
+  let (mut reader, mut writer) = io::split(device);
+  tokio::spawn(async move {
+    let mut keys = KeyFlags::empty();
+    while let Some(event) = event_rx.recv().await {
+      let flag = match event.dot {
+        1 => KeyFlags::Dot1,
+        2 => KeyFlags::Dot2,
+        3 => KeyFlags::Dot3,
+        4 => KeyFlags::Dot4,
+        5 => KeyFlags::Dot5,
+        6 => KeyFlags::Dot6,
+        7 => KeyFlags::Dot7,
+        8 => KeyFlags::Dot8,
+        _ => KeyFlags::Space,
+      };
+      if event.release {
+        keys -= flag;
+      }
+      else {
+        keys |= flag;
+      };
+      let mut report = write_report(input_report.clone(), vec![
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot1) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot2) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot3) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot4) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot5) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot6) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot7) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot8) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Space) { 1 } else { 0 })),
+        ReportFieldValue::UnsignedVariable(Some(0)),
+      ]);
+      let mut report_data = report.split_off(8);
+      for byte in report_data.chunks_mut(8) {
+        byte.reverse();
+      };
+      report.append(&mut report_data);
+      let report: Vec<u8> = report.into();
+      writer.write(&report).await.unwrap();
+    };
+  });
+  tokio::spawn(async move {
+    let mut buffer = vec![0; 64];
+    while let Ok(count) = reader.read(&mut buffer).await {
+      buffer.resize(count, 0);
+      println!("Report received");
+      println!("{:?}", read_report(output_report.clone(), buffer.clone().try_into().unwrap()));
+      buffer.resize(64, 0);
+    };
+  });
   let addr = "http://127.0.0.1:54123";
   let mut client = BtspeakKeyInterceptorClient::connect(addr).await.unwrap();
-  let mut stream = client.grab_key_combinations(Request::new(Empty {})).await.unwrap().into_inner();
-  let mut stream2 = client.grab_key_events(Request::new(Empty {})).await.unwrap().into_inner();
+  let mut stream = client.grab_key_events(Request::new(Empty {})).await.unwrap().into_inner();
   tokio::spawn(async move {
-    while let Some(combination) = stream.message().await.unwrap() {
-      println!("{:?}", combination);
+    while let Some(event) = stream.message().await.unwrap() {
+      event_tx.send(event).await.unwrap();
     };
-  });
-  tokio::spawn(async move {
-    while let Some(event) = stream2.message().await.unwrap() {
-      println!("{:?}", event);
-    };
-  });
-  tokio::spawn(async move {
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    client.set_excluded_key_combinations(Request::new(BrailleKeyCombinations { combinations: vec!(BrailleKeyCombination { dots: 14, space: false })})).await.unwrap();
-    client.set_excluded_key_events(Request::new(BrailleKeyEvents { events: vec!(
-      BrailleKeyEvent { dot: 1, release: false },
-      BrailleKeyEvent { dot: 1, release: true },
-    )})).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-    client.release_keyboard(Request::new(Empty {})).await.unwrap();
-  });
-  tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+  }).await.unwrap();
 }
