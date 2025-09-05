@@ -646,7 +646,7 @@ async fn main() {
       else {
         keys |= flag;
       };
-      let mut report = write_report(input_report.clone(), vec![
+      let report = write_report(input_report.clone(), vec![
         ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot1) { 1 } else { 0 })),
         ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot2) { 1 } else { 0 })),
         ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Dot3) { 1 } else { 0 })),
@@ -658,11 +658,6 @@ async fn main() {
         ReportFieldValue::UnsignedVariable(Some(if keys.contains(KeyFlags::Space) { 1 } else { 0 })),
         ReportFieldValue::UnsignedVariable(Some(0)),
       ]);
-      let mut report_data = report.split_off(8);
-      for byte in report_data.chunks_mut(8) {
-        byte.reverse();
-      };
-      report.append(&mut report_data);
       let report: Vec<u8> = report.into();
       writer.write(&report).await.unwrap();
     };
